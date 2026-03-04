@@ -3,16 +3,17 @@ export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
+      fontFamily: {
+        sans: ['Space Grotesk', 'system-ui', 'sans-serif'],
+        mono: ['Space Mono', 'monospace'],
+      },
       colors: {
-        bg:       '#0f0f0f',
-        surface:  '#1a1919',
-        surface2: '#242323',
-        border:   'rgba(255,255,255,0.085)',
-        accent:   '#e8c547',
-        cool:     '#7eb8f7',
+        bg:      '#000008',
+        surface: 'rgba(4,4,20,0.88)',
+        gold:    '#e8c547',
+        cyan:    '#5eead4',
       },
     },
   },
   plugins: [],
 }
-

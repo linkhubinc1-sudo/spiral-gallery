@@ -12,31 +12,46 @@ interface Props {
   onSelect: (a: Artwork) => void;
 }
 
-// Fibonacci sphere — images on a sphere surface
 function fibSphere(n: number, r: number): THREE.Vector3[] {
   const phi = Math.PI * (3 - Math.sqrt(5));
   return Array.from({ length: n }, (_, i) => {
-    const y     = 1 - (i / (n - 1)) * 2;
-    const rad   = Math.sqrt(Math.max(0, 1 - y * y));
-    const theta = phi * i;
-    const jitter = r * 0.08;
+    const y      = 1 - (i / (n - 1)) * 2;
+    const rad    = Math.sqrt(Math.max(0, 1 - y * y));
+    const theta  = phi * i;
+    const jitter = r * 0.07;
     return new THREE.Vector3(
       Math.cos(theta) * rad * r + (Math.random() - 0.5) * jitter,
-      y * r                      + (Math.random() - 0.5) * jitter,
-      Math.sin(theta) * rad * r  + (Math.random() - 0.5) * jitter,
+      y * r                     + (Math.random() - 0.5) * jitter,
+      Math.sin(theta) * rad * r + (Math.random() - 0.5) * jitter,
     );
   });
 }
 
+// ── Spatial hash for O(n) repulsion ──────────────────────────────────────────
+const CELL = 7; // minimum separation distance
+
+function cellKey(x: number, y: number, z: number): number {
+  const cx = Math.floor(x / CELL);
+  const cy = Math.floor(y / CELL);
+  const cz = Math.floor(z / CELL);
+  // Cantor-style hash — avoids string allocation
+  return cx * 73856093 ^ cy * 19349663 ^ cz * 83492791;
+}
+
+// Pre-allocated scratch vectors (outside component — zero GC)
+const _tmp  = new THREE.Vector3();
+const _diff = new THREE.Vector3();
+
 export default function ImageCloud({ artworks, selected, query, onSelect }: Props) {
   const { camera } = useThree();
 
-  // Physics state: pos + velocity per artwork
-  const physics = useRef<{ pos: THREE.Vector3; vel: THREE.Vector3 }[]>([]);
+  const physics  = useRef<{ pos: THREE.Vector3; vel: THREE.Vector3 }[]>([]);
   const targets  = useRef<THREE.Vector3[]>([]);
   const globeRef = useRef<THREE.Group>(null);
 
-  // Initialize on first artworks load
+  // Spatial hash rebuilt each frame — pre-allocated map
+  const spatialHash = useRef(new Map<number, number[]>());
+
   const basePositions = useMemo(
     () => fibSphere(artworks.length, 32),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -51,76 +66,85 @@ export default function ImageCloud({ artworks, selected, query, onSelect }: Prop
     targets.current = basePositions.map(p => p.clone());
   }, [basePositions]);
 
-  // Update target positions when selection or query changes
   useEffect(() => {
     if (!artworks.length || !targets.current.length) return;
+    const t = targets.current;
 
     if (selected) {
       const selIdx = artworks.findIndex(a => a.id === selected.id);
+      const dir = camera.position.clone().normalize();
+
       artworks.forEach((art, i) => {
-        const score = similarityScore(art, selected);
         if (i === selIdx) {
-          // Selected image moves forward toward camera
-          const dir = camera.position.clone().normalize();
-          targets.current[i] = basePositions[selIdx].clone().add(dir.multiplyScalar(10));
-        } else if (score > 0) {
-          // Similar: cluster near selected
+          t[i] = basePositions[selIdx].clone().add(dir.multiplyScalar(12));
+          return;
+        }
+        const score = similarityScore(art, selected);
+        if (score > 0) {
           const mix = Math.min(score / 4, 1);
-          targets.current[i] = basePositions[i].clone().lerp(basePositions[selIdx], mix * 0.45);
+          t[i] = basePositions[i].clone().lerp(basePositions[selIdx], mix * 0.45);
         } else {
-          // Dissimilar: drift outward
-          targets.current[i] = basePositions[i].clone().multiplyScalar(1.25);
+          t[i] = basePositions[i].clone().multiplyScalar(1.3);
         }
       });
     } else {
-      // Reset to base sphere positions
-      artworks.forEach((_, i) => {
-        targets.current[i] = basePositions[i].clone();
-      });
+      artworks.forEach((_, i) => { t[i] = basePositions[i].clone(); });
     }
   }, [selected, artworks, basePositions, camera.position]);
 
   useFrame((_state, delta) => {
     if (!globeRef.current) return;
 
-    // Globe slow auto-rotation (slows when zoomed in)
+    // Globe spin — slows as camera zooms in
     const dist = camera.position.length();
-    const spinSpeed = Math.max(0, (dist - 25) / 80) * 0.06;
-    globeRef.current.rotation.y += spinSpeed * delta;
+    const spin = Math.max(0, (dist - 20) / 90) * 0.055;
+    globeRef.current.rotation.y += spin * delta;
 
-    // Physics simulation
     const phys = physics.current;
     const tgts = targets.current;
     if (!phys.length || !tgts.length) return;
 
-    const tmpA = new THREE.Vector3();
-    const tmpB = new THREE.Vector3();
+    // ── Step 1: Build spatial hash O(n) ──────────────────────────────────────
+    const hash = spatialHash.current;
+    hash.clear();
+    for (let i = 0; i < phys.length; i++) {
+      const key = cellKey(phys[i].pos.x, phys[i].pos.y, phys[i].pos.z);
+      let bucket = hash.get(key);
+      if (!bucket) { bucket = []; hash.set(key, bucket); }
+      bucket.push(i);
+    }
+
+    // ── Step 2: Per-image forces O(n × k) where k ≈ constant ─────────────────
+    const CELL_D2 = CELL * CELL;
+    const SPRING  = 1.6;
+    const DAMP    = Math.pow(0.18, delta);
 
     for (let i = 0; i < phys.length; i++) {
       const p = phys[i];
 
       // Spring toward target
-      tmpA.copy(tgts[i]).sub(p.pos);
-      const springK = 1.8;
-      p.vel.addScaledVector(tmpA, springK * delta);
+      _tmp.copy(tgts[i]).sub(p.pos);
+      p.vel.addScaledVector(_tmp, SPRING * delta);
 
-      // Repulsion from nearby images (spatially limited)
-      for (let j = i + 1; j < phys.length; j++) {
-        tmpB.copy(p.pos).sub(phys[j].pos);
-        const d2 = tmpB.lengthSq();
-        const minD = 6;
-        if (d2 < minD * minD && d2 > 0.001) {
-          const force = (minD * minD - d2) * 0.4 * delta;
-          tmpB.normalize().multiplyScalar(force);
-          p.vel.add(tmpB);
-          phys[j].vel.sub(tmpB);
+      // Repulsion: only check images in the same spatial cell
+      const key = cellKey(p.pos.x, p.pos.y, p.pos.z);
+      const bucket = hash.get(key);
+      if (bucket) {
+        for (const j of bucket) {
+          if (j <= i) continue;
+          _diff.copy(p.pos).sub(phys[j].pos);
+          const d2 = _diff.lengthSq();
+          if (d2 < CELL_D2 && d2 > 0.001) {
+            const force = (CELL_D2 - d2) * 0.35 * delta;
+            _diff.normalize().multiplyScalar(force);
+            p.vel.add(_diff);
+            phys[j].vel.sub(_diff);
+          }
         }
       }
 
-      // Damping
-      p.vel.multiplyScalar(Math.pow(0.25, delta));
-
-      // Integrate
+      // Damping + integrate
+      p.vel.multiplyScalar(DAMP);
       p.pos.addScaledVector(p.vel, delta);
     }
   });
